@@ -12,7 +12,7 @@ from pip.req import InstallRequirement
 
 from . import click
 from .cache import DependencyCache
-from .exceptions import UnsupportedConstraint
+from .exceptions import NoCandidateFound, UnsupportedConstraint
 from .logging import log
 from .utils import (format_requirement, format_specifier, full_groupby,
                     is_pinned_requirement, key_from_ireq, key_from_req, UNSAFE_PACKAGES)
@@ -42,7 +42,8 @@ class RequirementSummary(object):
 
 
 class Resolver(object):
-    def __init__(self, constraints, repository, cache=None, prereleases=False, clear_caches=False, allow_unsafe=False):
+    def __init__(self, constraints, repository, cache=None, prereleases=False,
+                 clear_caches=False, allow_unsafe=False, allow_conflicts=False):
         """
         This class resolves a given set of constraints (a collection of
         InstallRequirement objects) by consulting the given Repository and the
@@ -58,6 +59,7 @@ class Resolver(object):
         self.clear_caches = clear_caches
         self.allow_unsafe = allow_unsafe
         self.unsafe_constraints = set()
+        self.allow_conflicts = allow_conflicts
 
     @property
     def constraints(self):
@@ -243,6 +245,10 @@ class Resolver(object):
 
             Flask==0.10.1 => Flask==0.10.1
 
+        If a match cannot be found, ``NoCandidateFound`` exception will be
+        raised. If ``self.allow_conflicts`` option is set to True, then we try
+        to find a match by using our constraints in the spec file
+        (requirements.in).
         """
         if ireq.editable:
             # NOTE: it's much quicker to immediately return instead of
@@ -253,7 +259,28 @@ class Resolver(object):
             # hitting the index server
             best_match = ireq
         else:
-            best_match = self.repository.find_best_match(ireq, prereleases=self.prereleases)
+            try:
+                best_match = self.repository.find_best_match(ireq, prereleases=self.prereleases)
+            except NoCandidateFound:
+                if not self.allow_conflicts:
+                    raise
+
+                # maybe we got a version conflict, try finding a match using our
+                # contraints for this requirement
+                for constraint in self.our_constraints:
+                    if constraint.req.name == ireq.req.name:
+                        new_req = constraint.req
+                        original_req = ireq.req
+                        # TODO: not sure if we should mutate ireq or create
+                        # a new object
+                        ireq.req = new_req
+
+                        best_match = self.repository.find_best_match(ireq, prereleases=self.prereleases)
+                        log.warning('Conflicting versions found: {}, using our constraints: {}'.format(
+                            original_req, new_req))
+                        break
+                else:
+                    raise
 
         # Format the best match
         log.debug('  found candidate {} (constraint was {})'.format(format_requirement(best_match),
